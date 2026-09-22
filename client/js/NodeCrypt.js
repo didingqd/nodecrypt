@@ -14,6 +14,16 @@ import chacha from 'js-chacha20';
 import {
 	Buffer
 } from 'buffer';
+// [新增-消息留存] 历史密钥派生与记录加解密
+import {
+	deriveHistoryKey,
+	deriveOwnerVerifier,
+	encryptRecord,
+	decryptRecord,
+	kindOfMessage,
+	isRecordTooLarge,
+	normalizeMinutes
+} from './util.history.js';
 window.Buffer = Buffer;
 
 // Main NodeCrypt class for secure communication
@@ -35,6 +45,9 @@ class NodeCrypt {
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
+			// [新增-消息留存] 历史记录与生效的留存策略
+			onHistory: callbacks.onHistory || null,
+			onRetention: callbacks.onRetention || null,
 		};
 		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key';
 		try {
@@ -49,6 +62,18 @@ class NodeCrypt {
 		this.reconnect = null;
 		this.ping = null;
 		this.channel = {};
+		// [新增-消息留存] 留存状态
+		// retentionRequest: 本地请求的时长（仅房间首次创建时有效，随 j 提交）
+		// retentionMinutes: 服务器确认的生效时长，0 表示不存储
+		// retentionOwned: 本次连接是否被服务器认定为房主（可修改留存时长）
+		// historyKey: 由房间密码派生的历史密钥，无密码时为 null
+		// ownerVerifier: 由管理密码派生的房主验证值，未填管理密码时为 null
+		this.retentionRequest = 0;
+		this.retentionMinutes = 0;
+		this.retentionOwned = false;
+		this.historyKey = null;
+		this.historyKeyPromise = null;
+		this.ownerVerifierPromise = null;
 		this.setCredentials = this.setCredentials.bind(this);
 		this.connect = this.connect.bind(this);
 		this.destruct = this.destruct.bind(this);
@@ -69,19 +94,34 @@ class NodeCrypt {
 		this.encryptServerMessage = this.encryptServerMessage.bind(this);
 		this.decryptServerMessage = this.decryptServerMessage.bind(this);
 		this.encryptClientMessage = this.encryptClientMessage.bind(this);
-		this.decryptClientMessage = this.decryptClientMessage.bind(this)
+		this.decryptClientMessage = this.decryptClientMessage.bind(this);
+		// [新增-消息留存]
+		this.getHistoryKey = this.getHistoryKey.bind(this);
+		this.getOwnerVerifier = this.getOwnerVerifier.bind(this);
+		this.storeChannelMessage = this.storeChannelMessage.bind(this);
+		this.decryptHistoryRecord = this.decryptHistoryRecord.bind(this);
+		this.requestHistory = this.requestHistory.bind(this);
+		this.setRetention = this.setRetention.bind(this)
 	}
 
 	// Set user credentials (username, channel, password)
 	// 设置用户凭证（用户名、频道、密码）
-	setCredentials(username, channel, password) {
+	// [新增-消息留存] 增加 retentionMinutes（请求的留存时长）与 ownerPassword（房主管理密码）
+	setCredentials(username, channel, password, retentionMinutes, ownerPassword) {
 		this.logEvent('setCredentials');
 		try {
 			this.credentials = {
 				username: username,
 				channel: sha256(channel),
 				password: sha256(password)
-			}
+			};
+			// [新增-消息留存] 记录请求的时长并立即开始派生密钥（无密码时结果为 null）
+			this.retentionRequest = normalizeMinutes(retentionMinutes);
+			this.retentionMinutes = 0;
+			this.retentionOwned = false;
+			this.historyKey = null;
+			this.historyKeyPromise = deriveHistoryKey(channel, password);
+			this.ownerVerifierPromise = deriveOwnerVerifier(channel, ownerPassword)
 		} catch (error) {
 			this.logEvent('setCredentials', error, 'error');
 			return (false)
@@ -101,6 +141,9 @@ class NodeCrypt {
 		this.serverKeys = null;
 		this.serverShared = null;
 		this.channel = {};
+		// [新增-消息留存] 重连后需要由服务器重新确认生效策略与房主身份
+		this.retentionMinutes = 0;
+		this.retentionOwned = false;
 		try {
 			this.connection = new WebSocket(this.config.wsAddress);
 			this.connection.onopen = this.onOpen;
@@ -134,6 +177,15 @@ class NodeCrypt {
 		this.callbacks.onClientSecured = null;
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
+		// [新增-消息留存] 清理历史留存状态
+		this.callbacks.onHistory = null;
+		this.callbacks.onRetention = null;
+		this.historyKey = null;
+		this.historyKeyPromise = null;
+		this.ownerVerifierPromise = null;
+		this.retentionRequest = 0;
+		this.retentionMinutes = 0;
+		this.retentionOwned = false;
 		this.clientEc = null;
 		this.serverKeys = null;
 		this.serverShared = null;
@@ -215,9 +267,13 @@ class NodeCrypt {
 							namedCurve: 'P-384'
 						}, true, [])
 					}, this.serverKeys.privateKey, 384)).slice(8, 40);
+					// [新增-消息留存] 首个进入房间时用它决定留存时长（之后只有房主能改）
+					// o 为房主验证值，由管理密码派生；未填管理密码时为 null
 					this.sendMessage(this.encryptServerMessage({
 						a: 'j',
-						p: this.credentials.channel
+						p: this.credentials.channel,
+						r: this.retentionRequest,
+						o: await this.getOwnerVerifier()
 					}, this.serverShared));
 					if (this.callbacks.onServerSecured) {
 						try {
@@ -278,6 +334,36 @@ class NodeCrypt {
 					this.callbacks.onClientList(clients)
 				} catch (error) {
 					this.logEvent('onMessage-client-list-callback', error, 'error')
+				}
+			}
+			return
+		}
+		// [新增-消息留存] 生效的留存策略（0 表示不存储）与房主身份
+		if (serverDecrypted.a === 'r' && this.isObject(serverDecrypted.p)) {
+			this.retentionMinutes = normalizeMinutes(serverDecrypted.p.m);
+			// owned 只在加入房间时下发；房主改策略后的广播不带该字段，
+			// 此时保留本连接原有的房主状态
+			if (typeof serverDecrypted.p.owned === 'boolean') {
+				this.retentionOwned = serverDecrypted.p.owned
+			}
+			this.logEvent('onMessage-retention', [this.retentionMinutes, this.retentionOwned]);
+			if (this.callbacks.onRetention) {
+				try {
+					this.callbacks.onRetention(this.retentionMinutes, this.retentionOwned)
+				} catch (error) {
+					this.logEvent('onMessage-retention-callback', error, 'error')
+				}
+			}
+			return
+		}
+		// [新增-消息留存] 一页历史记录（密文，由调用方用历史密钥解密）
+		if (serverDecrypted.a === 'h' && this.isObject(serverDecrypted.p)) {
+			this.logEvent('onMessage-history', this.isArray(serverDecrypted.p.records) ? serverDecrypted.p.records.length : 0);
+			if (this.callbacks.onHistory) {
+				try {
+					this.callbacks.onHistory(serverDecrypted.p)
+				} catch (error) {
+					this.logEvent('onMessage-history-callback', error, 'error')
 				}
 			}
 			return
@@ -507,12 +593,148 @@ class NodeCrypt {
 					}
 					this.connection.send(payload)
 				}
+				// [新增-消息留存] 额外提交一份给服务器留存。
+				// 独立异步执行且不 await：留存失败绝不影响实时投递，
+				// 未开启留存（retentionMinutes=0）时会立即返回。
+				this.storeChannelMessage(type, data);
 				return (true)
 			} catch (error) {
 				this.logEvent('sendChannelMessage', error, 'error')
 			}
 		}
 		return (false)
+	}
+
+	// [新增-消息留存] 取得历史密钥（惰性等待 PBKDF2 派生结果）
+	// 无房间密码或派生失败时返回 null，此时留存自动不可用
+	async getHistoryKey() {
+		if (this.historyKey) {
+			return (this.historyKey)
+		}
+		if (!this.historyKeyPromise) {
+			return (null)
+		}
+		try {
+			this.historyKey = await this.historyKeyPromise
+		} catch (error) {
+			this.logEvent('getHistoryKey', error, 'error');
+			this.historyKey = null
+		}
+		return (this.historyKey)
+	}
+
+	// [新增-消息留存] 把一条公共频道消息额外加密一份提交给服务器留存。
+	// 仅覆盖文本与图片；文件分卷体积过大，不在留存范围内。
+	async storeChannelMessage(type, data) {
+		try {
+			// 服务器尚未确认策略（或策略为 0）时不落库
+			if (!this.retentionMinutes || this.retentionMinutes <= 0) {
+				return (false)
+			}
+			const kind = kindOfMessage(type);
+			if (!kind) {
+				return (false)
+			}
+			const historyKey = await this.getHistoryKey();
+			if (!historyKey) {
+				return (false)
+			}
+			const ts = Date.now();
+			const record = await encryptRecord(historyKey, this.credentials.channel, ts, kind, {
+				u: this.credentials.username,
+				t: type,
+				d: data
+			});
+			if (!record || !this.serverShared || !this.isOpen()) {
+				return (false)
+			}
+			// 超过服务器允许的单条上限则不留存，内容依旧已正常实时送达
+			if (isRecordTooLarge(record)) {
+				this.logEvent('storeChannelMessage', 'record too large, skipped');
+				return (false)
+			}
+			this.sendMessage(this.encryptServerMessage({
+				a: 'hs',
+				p: {
+					k: kind,
+					ts: ts,
+					n: record.n,
+					c: record.c
+				}
+			}, this.serverShared));
+			return (true)
+		} catch (error) {
+			this.logEvent('storeChannelMessage', error, 'error');
+			return (false)
+		}
+	}
+
+	// [新增-消息留存] 解密一条历史记录（供 room.js 回放历史使用）
+	// 密码不符或记录被篡改时返回 null
+	async decryptHistoryRecord(record) {
+		if (!record) {
+			return (null)
+		}
+		const historyKey = await this.getHistoryKey();
+		if (!historyKey) {
+			return (null)
+		}
+		return (await decryptRecord(historyKey, this.credentials.channel, record))
+	}
+
+	// [新增-消息留存] 请求下一页历史（分页拉取）
+	requestHistory(since) {
+		if (!this.serverShared || !this.isOpen()) {
+			return (false)
+		}
+		try {
+			return (this.sendMessage(this.encryptServerMessage({
+				a: 'h',
+				p: {
+					since: Number(since) || 0
+				}
+			}, this.serverShared)))
+		} catch (error) {
+			this.logEvent('requestHistory', error, 'error');
+			return (false)
+		}
+	}
+
+	// [新增-消息留存] 取得房主验证值（惰性等待 PBKDF2 派生结果）
+	// 未填管理密码时返回 null，此时本连接不会被认定为房主
+	async getOwnerVerifier() {
+		if (!this.ownerVerifierPromise) {
+			return (null)
+		}
+		try {
+			return (await this.ownerVerifierPromise)
+		} catch (error) {
+			this.logEvent('getOwnerVerifier', error, 'error');
+			return (null)
+		}
+	}
+
+	// [新增-消息留存] 房主修改本房间留存时长
+	// 0 表示不再保存，服务器会同时清除该房间已保存的全部历史
+	// 服务端会再次校验房主身份，这里的前置判断只是为了少发一次无效请求
+	setRetention(minutes) {
+		if (!this.retentionOwned) {
+			return (false)
+		}
+		if (!this.serverShared || !this.isOpen()) {
+			return (false)
+		}
+		try {
+			return (this.sendMessage(this.encryptServerMessage({
+				a: 'rs',
+				p: {
+					m: normalizeMinutes(minutes)
+				}
+			}, this.serverShared)))
+		} catch (error) {
+			this.logEvent('setRetention', error, 'error');
+			return (false)
+		}
 	}
 
 	// Encrypt a message for the server

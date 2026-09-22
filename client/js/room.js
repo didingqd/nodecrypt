@@ -21,6 +21,8 @@ import {
 	createElement
 } from './util.dom.js';
 import { t } from './util.i18n.js';
+// [新增-消息留存] 留存时长文案
+import { formatRetention } from './util.history.js';
 let roomsData = [];
 let activeRoomIndex = -1;
 
@@ -39,7 +41,13 @@ export function getNewRoomData() {
 		knownUserIds: new Set(),
 		unreadCount: 0,
 		privateChatTargetId: null,
-		privateChatTargetName: null
+		privateChatTargetName: null,
+		// [新增-消息留存] 服务器确认的生效留存时长（分钟，0=不存储）
+		retentionMinutes: 0,
+		// [新增-消息留存] 本连接是否被认定为房主（可修改留存时长）
+		retentionOwned: false,
+		// [新增-消息留存] 已回放到的最大消息序号，用于分页与重连去重
+		lastSeq: 0
 	}
 }
 
@@ -94,11 +102,15 @@ export function renderRooms(activeId = 0) {
 
 // Join a room
 // 加入一个房间
-export function joinRoom(userName, roomName, password, modal = null, onResult) {
+// [新增-消息留存] 增加 retentionMinutes（请求的留存时长）与 ownerPassword（房主管理密码）
+// 留存时长仅对「首次创建该房间的人」生效；此后只有持管理密码的房主能修改
+export function joinRoom(userName, roomName, password, modal = null, onResult, retentionMinutes = 0, ownerPassword = '') {
 	const newRd = getNewRoomData();
 	newRd.roomName = roomName;
 	newRd.myUserName = userName;
 	newRd.password = password;
+	// [新增-消息留存] 先按请求值展示，服务器确认后会通过 onRetention 覆盖为生效值
+	newRd.retentionMinutes = retentionMinutes;
 	roomsData.push(newRd);
 	const idx = roomsData.length - 1;
 	switchRoom(idx);
@@ -132,10 +144,16 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
-		onClientMessage: (msg) => handleClientMessage(idx, msg)
+		onClientMessage: (msg) => handleClientMessage(idx, msg),
+		// [新增-消息留存] 历史记录、生效策略与房主身份
+		onHistory: (payload) => {
+			handleHistory(idx, payload).catch((error) => console.error('history replay failed', error))
+		},
+		onRetention: (minutes, owned) => handleRetention(idx, minutes, owned)
 	};
 	const chatInst = new window.NodeCrypt(window.config, callbacks);
-	chatInst.setCredentials(userName, roomName, password);
+	// [新增-消息留存] 后两个参数为请求的留存时长与房主管理密码
+	chatInst.setCredentials(userName, roomName, password, retentionMinutes, ownerPassword);
 	chatInst.connect();
 	roomsData[idx].chat = chatInst
 }
@@ -334,6 +352,102 @@ export function handleClientMessage(idx, msg) {
 	const notificationMsgType = msgType.includes('_private') ? `private ${msgType.split('_')[0]}` : msgType;
 	if (window.notifyMessage) {
 		window.notifyMessage(newRd.roomName, notificationMsgType, msg.data, realUserName);
+	}
+}
+
+// ============================================================
+// [新增-消息留存] 历史回放
+// ============================================================
+
+// 处理服务器下发的生效留存策略与房主身份
+export function handleRetention(idx, minutes, owned) {
+	const rd = roomsData[idx];
+	if (!rd) return;
+	const previous = rd.retentionMinutes;
+	rd.retentionMinutes = minutes;
+	// owned 只在加入房间时下发；策略变更的广播不带该字段，此时保持原状
+	if (typeof owned === 'boolean') {
+		rd.retentionOwned = owned
+	}
+	// 通知设置面板刷新（它可能正开着，且内容依赖这两个值）
+	try {
+		window.dispatchEvent(new CustomEvent('retentionChange', {
+			detail: { roomIndex: idx, minutes: minutes, owned: rd.retentionOwned }
+		}))
+	} catch (error) {
+		console.error('dispatch retentionChange failed', error)
+	}
+	// 非当前房间、或策略没变且已提示过 → 不再打扰
+	if (activeRoomIndex !== idx) return;
+	if (previous === minutes && rd.retentionNotified) return;
+	rd.retentionNotified = true;
+	if (minutes > 0) {
+		const text = t('system.retention_on', 'Messages in this room are kept for {value}')
+			.replace('{value}', formatRetention(minutes));
+		addSystemMsg(rd.retentionOwned
+			? `${text} · ${t('system.retention_owner', 'you are the owner and can change this in settings')}`
+			: text, true)
+	} else {
+		addSystemMsg(t('system.retention_off', 'Messages are not stored in this room'), true)
+	}
+}
+
+// 处理一页历史记录：解密后按原顺序回放到聊天区
+export async function handleHistory(idx, payload) {
+	const rd = roomsData[idx];
+	if (!rd || !rd.chat || !payload || !Array.isArray(payload.records)) return;
+
+	for (const record of payload.records) {
+		// 解密是异步的，期间用户可能已退出房间（roomsData 会被 splice 导致索引错位），
+		// 因此每轮都要确认这个索引仍然指向同一个房间对象
+		if (roomsData[idx] !== rd) return;
+		const seq = Number(record && record.seq) || 0;
+		// 重连后服务器会重新下发全部历史，用 lastSeq 去重
+		if (seq <= rd.lastSeq) continue;
+		// 无论能否解密都推进游标，避免无法解密的记录导致分页死循环
+		rd.lastSeq = seq;
+		// 密码不符或记录被篡改时返回 null，静默跳过（与直播消息的行为一致）
+		const plain = await rd.chat.decryptHistoryRecord(record);
+		if (!plain) continue;
+		appendHistoryMessage(idx, plain, record.ts)
+	}
+
+	// 游标推进到本页的高水位：即使有记录因无法解密或对象缺失被跳过，
+	// 也必须前进，否则下一页会反复请求同一批数据
+	const pageLastSeq = Number(payload.lastSeq) || 0;
+	if (pageLastSeq > rd.lastSeq) rd.lastSeq = pageLastSeq;
+
+	// 还有下一页则继续拉取
+	if (roomsData[idx] === rd && payload.more && rd.chat && typeof rd.chat.requestHistory === 'function') {
+		rd.chat.requestHistory(rd.lastSeq)
+	}
+}
+
+// 把一条已解密的历史记录追加到消息列表与聊天区
+function appendHistoryMessage(idx, plain, ts) {
+	const rd = roomsData[idx];
+	if (!rd) return;
+	const userName = plain && plain.u ? plain.u : t('ui.anonymous', 'Anonymous');
+	const msgType = plain && plain.t ? plain.t : 'text';
+	const data = plain ? plain.d : '';
+	const timestamp = Number(ts) || Date.now();
+	// 历史记录里不带客户端 ID，只能用用户名判断是不是自己发的；
+	// 这与 handleClientMessage 中跳过自己消息的判断方式保持一致
+	const isSelf = !!(rd.myUserName && userName === rd.myUserName);
+
+	rd.messages.push({
+		type: isSelf ? 'me' : 'other',
+		text: data,
+		userName: userName,
+		avatar: userName,
+		msgType: msgType,
+		timestamp: timestamp
+	});
+
+	if (activeRoomIndex === idx) {
+		// isHistory=true 时不会重复写入 messages，这里已经手动写过了
+		if (isSelf) addMsg(data, true, msgType, timestamp);
+		else addOtherMsg(data, userName, userName, true, msgType, timestamp)
 	}
 }
 

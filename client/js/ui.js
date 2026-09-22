@@ -25,6 +25,14 @@ import {
 import {
 	updateChatInputStyle
 } from './chat.js';
+// [新增-消息留存] 留存偏好与取值校验
+import {
+	getRetentionPreference,
+	setRetentionPreference,
+	normalizeMinutes,
+	canEnableRetention,
+	HISTORY_MAX_MINUTES
+} from './util.history.js';
 
 // Utility functions for security and error handling
 // 安全和错误处理工具函数
@@ -133,12 +141,15 @@ function handleShareAction() {
 	const rd = roomsData[activeRoomIndex];
 	const roomName = rd.roomName.trim();
 	const password = rd.password || '';
-	
+
 	// Encrypt room name and password
 	const encryptedRoom = simpleEncrypt(roomName);
 	const encryptedPwd = password ? simpleEncrypt(password) : '';
-	
+
 	// Create share URL with encrypted data
+	// [注意-消息留存] 分享链接**只能**带房间名与房间密码。
+	// 房主管理密码绝不能放进链接：它是「谁能修改/清空留存」的唯一凭据，
+	// 一旦随链接流出，拿到链接的任何人都能成为房主。
 	let url = `${location.origin}${location.pathname}?r=${encodeURIComponent(encryptedRoom)}`;
 	if (encryptedPwd) {
 		url += `&p=${encodeURIComponent(encryptedPwd)}`;
@@ -422,6 +433,19 @@ export function loginFormHandler(modal) {
 			btn = document.querySelector('#login-form .login-btn');
 			roomInput = document.getElementById('roomName')
 		}
+		// [新增-消息留存] 读取留存时长（分钟）；无密码时强制为 0，因为此时没有
+		// 服务器不知道的密钥材料，无法在不破坏零知识的前提下保存历史
+		const retentionInput = document.getElementById('retention' + (modal ? '-modal' : ''));
+		let retentionMinutes = normalizeMinutes(retentionInput ? retentionInput.value : 0);
+		if (!canEnableRetention(password)) {
+			retentionMinutes = 0
+		} else {
+			// 记住本次选择，作为下次新建房间时的默认值
+			setRetentionPreference(retentionMinutes)
+		}
+		// [新增-消息留存] 房主管理密码：填了才能修改留存时长，也是换设备后被认作房主的凭据
+		const ownerInput = document.getElementById('ownerPassword' + (modal ? '-modal' : ''));
+		const ownerPassword = ownerInput ? ownerInput.value.trim() : '';
 		const exists = roomsData.some(rd => rd.roomName && rd.roomName.toLowerCase() === roomName.toLowerCase());
 		if (roomInput) {
 			roomInput.style.border = '';
@@ -457,7 +481,7 @@ export function loginFormHandler(modal) {
 				btn.disabled = false;
 				btn.innerText = 'ENTER'
 			}
-		})
+		}, retentionMinutes, ownerPassword)
 	}
 }
 
@@ -465,6 +489,8 @@ export function loginFormHandler(modal) {
 // Generate login form HTML
 export function generateLoginForm(isModal = false) {
 	const idPrefix = isModal ? '-modal' : '';
+	// [新增-消息留存] 留存时长默认取本地偏好，0 表示不保存（保持原有行为）
+	const retentionPreference = getRetentionPreference();
 	return `		<div class="input-group">
 			<input id="userName${idPrefix}" type="text" autocomplete="username" required minlength="1" maxlength="15" placeholder="">
 			<label for="userName${idPrefix}" class="floating-label">${t('ui.username', 'Username')}</label>
@@ -477,8 +503,61 @@ export function generateLoginForm(isModal = false) {
 			<input id="password${idPrefix}" type="password" autocomplete="${isModal ? 'off' : 'current-password'}" minlength="1" maxlength="15" placeholder="">
 			<label for="password${idPrefix}" class="floating-label">${t('ui.node_password', 'Room Password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
 		</div>
+		<div class="input-group">
+			<input id="retention${idPrefix}" type="number" min="0" max="${HISTORY_MAX_MINUTES}" step="1" value="${retentionPreference}" placeholder="">
+			<label for="retention${idPrefix}" class="floating-label">${t('ui.retention', 'Keep messages (minutes)')}</label>
+			<div id="retention-hint${idPrefix}" style="display:none;color:#e74c3c;font-size:13px;margin-top:4px;">${t('ui.retention_requires_password', 'A room password is required to keep history')}</div>
+		</div>
+		<div class="input-group">
+			<input id="ownerPassword${idPrefix}" type="password" autocomplete="${isModal ? 'off' : 'current-password'}" maxlength="15" placeholder="">
+			<label for="ownerPassword${idPrefix}" class="floating-label">${t('ui.owner_password', 'Owner password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
+			<div id="owner-hint${idPrefix}" style="display:none;color:#e74c3c;font-size:13px;margin-top:4px;">${t('ui.owner_password_hint', 'Without an owner password the retention time can never be changed')}</div>
+		</div>
 		<button type="submit" class="login-btn">${t('ui.enter', 'ENTER')}</button>
 	`;
+}
+
+// [新增-消息留存] 把留存输入框、房主管理密码与房间密码三者联动起来
+// - 无房间密码时没有服务器不知道的密钥材料，留存必须禁用并置零
+// - 设了留存时长却没设管理密码时给出提示（此后无法再修改）
+// 可重复调用：只在首次调用时绑定事件，之后仅重新同步状态
+export function setupRetentionField(prefix = '') {
+	const retentionInput = document.getElementById('retention' + prefix);
+	const passwordInput = document.getElementById('password' + prefix);
+	const ownerInput = document.getElementById('ownerPassword' + prefix);
+	if (!retentionInput || !passwordInput) return;
+
+	const hint = document.getElementById('retention-hint' + prefix);
+	const ownerHint = document.getElementById('owner-hint' + prefix);
+
+	function sync() {
+		const enabled = canEnableRetention(passwordInput.value);
+		retentionInput.disabled = !enabled;
+		retentionInput.style.background = enabled ? '' : '#f5f5f5';
+		retentionInput.style.cursor = enabled ? '' : 'not-allowed';
+		if (hint) hint.style.display = enabled ? 'none' : 'block';
+		if (!enabled) retentionInput.value = '0';
+
+		// 留存时长 > 0 但没填管理密码 → 提示此后无法修改
+		if (ownerHint && ownerInput) {
+			const wantsRetention = enabled && normalizeMinutes(retentionInput.value) > 0;
+			const hasOwner = ownerInput.value.trim().length > 0;
+			ownerHint.style.display = (wantsRetention && !hasOwner) ? 'block' : 'none';
+		}
+	}
+
+	if (!retentionInput.dataset.retentionBound) {
+		retentionInput.dataset.retentionBound = '1';
+		passwordInput.addEventListener('input', sync);
+		passwordInput.addEventListener('change', sync);
+		retentionInput.addEventListener('input', sync);
+		retentionInput.addEventListener('change', sync);
+		if (ownerInput) {
+			ownerInput.addEventListener('input', sync);
+			ownerInput.addEventListener('change', sync);
+		}
+	}
+	sync();
 }
 export function openLoginModal() {
 	const modal = document.createElement('div');
@@ -571,6 +650,9 @@ export function autofillRoomPwd(formPrefix = '') {
 	if (roomValue || pwdValue) {
 		window.history.replaceState({}, '', location.pathname);
 	}
+
+	// [新增-消息留存] 密码可能是上面刚自动填充的，这里再同步一次留存输入框状态
+	setupRetentionField(formPrefix);
 }
 
 // 初始化登录表单
@@ -586,6 +668,9 @@ export function initLoginForm() {
 	// 为登录页面添加class，用于手机适配
 	// Add class to login page for mobile adaptation
 	document.body.classList.add('login-page');
+
+	// [新增-消息留存] 绑定留存输入框（autofillRoomPwd 之后还会再同步一次）
+	setupRetentionField('');
 }
 
 // Listen for language change events to refresh UI
@@ -605,6 +690,9 @@ window.addEventListener('regenerateLoginForm', () => {
 	const loginFormContainer = document.getElementById('login-form');
 	if (loginFormContainer) {
 		loginFormContainer.innerHTML = generateLoginForm(false);
+		// [新增-消息留存] 表单被重建后留存输入框是全新元素，
+		// 需要重新绑定它与密码输入框的联动
+		setupRetentionField('');
 	}
 });
 

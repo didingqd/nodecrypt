@@ -18,3 +18,32 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ChatRoom"]
+
+# ============================================================
+# [新增-消息留存] 消息留存所需的存储绑定
+#
+# 部署前需要先创建资源，并把返回的 id 填到下面：
+#   npx wrangler d1 create nodecrypt-history
+#   npx wrangler r2 bucket create nodecrypt-history-blobs
+#   npx wrangler d1 migrations apply nodecrypt-history --remote
+#
+# 若暂时不需要留存功能：删掉（或注释掉）下面两段绑定即可，
+# 客户端与 Worker 都会自动降级为「不存储」，实时聊天不受影响。
+#
+# 注意：这两段绑定一旦填写不存在的 id，wrangler 会拒绝部署，
+# 所以务必先把上面的 create 命令执行完。
+# ============================================================
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nodecrypt-history"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "worker/migrations"
+
+[[r2_buckets]]
+binding = "HISTORY_BLOB"
+bucket_name = "nodecrypt-history-blobs"
+
+# [新增-消息留存] 每分钟清理一次过期历史（留存分辨率要求 1 分钟）
+[triggers]
+crons = ["* * * * *"]

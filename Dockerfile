@@ -11,9 +11,10 @@ COPY server/package.json ./server/
 # 安装生产依赖
 RUN cd server && npm install --production --no-package-lock --no-audit
 
-# Copy only the server.js file
-# 仅复制 server.js 文件
-COPY server/server.js ./server/
+# Copy only the server-side JS files
+# 仅复制服务器端 JS 文件
+# [新增-消息留存] 改为通配符，以便一并带上新增的 server/history.js
+COPY server/*.js ./server/
 
 # Frontend build stage
 # 前端构建阶段

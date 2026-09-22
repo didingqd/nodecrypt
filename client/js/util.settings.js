@@ -18,12 +18,17 @@ import { THEMES, getCurrentTheme, applyTheme } from './util.theme.js';
 // Import i18n utilities
 // 导入国际化工具函数
 import { t, setLanguage, getCurrentLanguage, initI18n } from './util.i18n.js';
+// [新增-消息留存] 当前房间的生效留存策略与本地偏好
+import { roomsData, activeRoomIndex } from './room.js';
+import { formatRetention, normalizeMinutes, setRetentionPreference, HISTORY_MAX_MINUTES } from './util.history.js';
 // Default settings
 // 默认设置
 const DEFAULT_SETTINGS = {
 	notify: false,
 	sound: false,
-	theme: 'theme1'
+	theme: 'theme1',
+	// [新增-消息留存] 新建房间时的默认留存分钟数，0=不保存（保持原有行为）
+	retention: 0
 	// 注意：我们不设置默认语言，让系统自动检测浏览器语言
 	// Note: We don't set a default language, let the system auto-detect browser language
 };
@@ -50,13 +55,16 @@ function saveSettings(settings) {
 		notify,
 		sound,
 		theme,
-		language
+		language,
+		// [新增-消息留存] 必须一并写出，否则会被本次写入抹掉
+		retention
 	} = settings;
 	localStorage.setItem('settings', JSON.stringify({
 		notify,
 		sound,
 		theme,
-		language
+		language,
+		retention
 	}))
 }
 
@@ -87,12 +95,44 @@ function setupSettingsPanel() {
 	if (!settingsSidebar || !settingsContent) return;
 
 	const settings = loadSettings();
-	
+
 	// Update settings title
 	// 更新设置标题
 	if (settingsTitle) {
 		settingsTitle.textContent = t('settings.title', 'Settings');
-	}// Create settings content HTML
+	}
+	// [新增-消息留存] 当前房间的生效留存策略（只有房主能改）
+	const currentRoom = roomsData[activeRoomIndex];
+	const currentRetentionText = currentRoom
+		? formatRetention(currentRoom.retentionMinutes)
+		: '—';
+	const currentRoomOwned = !!(currentRoom && currentRoom.retentionOwned);
+	const ownedBadge = currentRoomOwned
+		? ` <span style="color:#30a8f7;font-size:0.8rem;">(${t('settings.retention_owner_badge', 'you are the owner')})</span>`
+		: '';
+	// 房主显示可编辑的「修改本房间留存」，其他人只显示提示
+	let ownerBlock = '';
+	if (currentRoom && currentRoom.chat) {
+		if (currentRoomOwned) {
+			ownerBlock = `
+			<div class="settings-item">
+				<div class="settings-item-label">
+					<div>${t('settings.retention_change', "Change this room's retention (minutes)")}</div>
+				</div>
+				<div style="display:flex;gap:6px;align-items:center;">
+					<input type="number" id="settings-retention-room" min="0" max="${HISTORY_MAX_MINUTES}" step="1" value="${normalizeMinutes(currentRoom.retentionMinutes)}"
+						style="width:90px;padding:6px 8px;border:1px solid #e0e0e0;border-radius:8px;font-size:14px;text-align:center;outline:none;">
+					<button type="button" id="settings-retention-apply"
+						style="padding:6px 14px;border:none;border-radius:8px;background:#30a8f7;color:#fff;font-size:14px;cursor:pointer;">${t('settings.retention_apply', 'Apply')}</button>
+				</div>
+			</div>
+			<div class="settings-item-description" style="color:#e74c3c;">${t('settings.retention_zero_warning', 'Setting 0 immediately clears all history stored for this room')}</div>`;
+		} else {
+			ownerBlock = `
+			<div class="settings-item-description">${t('settings.retention_owner_only', 'Only the room owner (whoever knows the owner password) can change this')}</div>`;
+		}
+	}
+	// Create settings content HTML
 	settingsContent.innerHTML = `
 		<div class="settings-section">
 			<div class="settings-section-title">${t('settings.notification', 'Notification Settings')}</div>
@@ -114,6 +154,24 @@ function setupSettingsPanel() {
 					<span class="slider"></span>
 				</label>
 			</div>
+		</div>
+		<div class="settings-section">
+			<div class="settings-section-title">${t('settings.retention', 'Message Retention')}</div>
+			<div class="settings-item">
+				<div class="settings-item-label">
+					<div>${t('settings.retention_current', 'This room keeps messages')}${ownedBadge}</div>
+				</div>
+				<span style="font-weight:500;color:#30a8f7;font-size:0.9rem;">${currentRetentionText}</span>
+			</div>
+			${ownerBlock}
+			<div class="settings-item">
+				<div class="settings-item-label">
+					<div>${t('settings.retention_default', 'Default for new rooms (minutes)')}</div>
+				</div>
+				<input type="number" id="settings-retention" min="0" max="${HISTORY_MAX_MINUTES}" step="1" value="${normalizeMinutes(settings.retention)}"
+					style="width:90px;padding:6px 8px;border:1px solid #e0e0e0;border-radius:8px;font-size:14px;text-align:center;outline:none;">
+			</div>
+			<div class="settings-item-description">${t('settings.retention_note', 'A new room\'s retention is decided by the first person who joins it. 0 means nothing is stored. History is end-to-end encrypted with the room password, so the server only ever holds ciphertext.')}</div>
 		</div>
 				<div class="settings-section">
 			<div class="settings-section-title">${t('settings.language', 'Language Settings')}</div>
@@ -142,6 +200,8 @@ function setupSettingsPanel() {
 	`;	const notifyCheckbox = $('#settings-notify', settingsContent);
 	const soundCheckbox = $('#settings-sound', settingsContent);
 	const languageSelect = $('#settings-language', settingsContent);
+	// [新增-消息留存] 新建房间时的默认留存时长输入框
+	const retentionInput = $('#settings-retention', settingsContent);
 	
 	// Language select event handler
 	// 语言选择事件处理
@@ -210,6 +270,31 @@ function setupSettingsPanel() {
 		}
 		saveSettings(settings);
 		applySettings(settings)
+	});
+	// [新增-消息留存] 保存默认留存时长；只影响新建房间，已加入房间的策略由房主决定
+	on(retentionInput, 'change', e => {
+		const minutes = normalizeMinutes(e.target.value);
+		e.target.value = minutes;
+		settings.retention = minutes;
+		// 走统一的读写函数，保持 localStorage 中的结构一致
+		setRetentionPreference(minutes);
+		saveSettings(settings);
+	});
+	// [新增-消息留存] 房主修改当前房间的留存时长
+	// 服务端会再次校验房主身份，这里只是少发一次无效请求
+	const roomRetentionInput = $('#settings-retention-room', settingsContent);
+	on($('#settings-retention-apply', settingsContent), 'click', () => {
+		const rd = roomsData[activeRoomIndex];
+		if (!rd || !rd.chat || typeof rd.chat.setRetention !== 'function') return;
+		const minutes = normalizeMinutes(roomRetentionInput ? roomRetentionInput.value : 0);
+		if (roomRetentionInput) roomRetentionInput.value = minutes;
+		const sent = rd.chat.setRetention(minutes);
+		if (window.addSystemMsg) {
+			window.addSystemMsg(sent
+				? t('system.retention_sent', 'Retention change sent')
+				: t('action.action_failed', 'Action failed. Please try again.'), true);
+		}
+		// 服务器确认后会广播回来，届时的 retentionChange 事件会刷新本面板
 	});
 	// Theme selection event handlers
 	// 主题选择事件处理
@@ -456,6 +541,15 @@ function initSettings() {
 		const settingsTitle = $id('settings-title');
 		if (settingsTitle) {
 			settingsTitle.textContent = t('settings.title', 'Settings');
+		}
+	});
+
+	// [新增-消息留存] 生效策略或房主身份变化时刷新设置面板（panel 正开着才有意义）
+	window.addEventListener('retentionChange', () => {
+		const settingsSidebar = $id('settings-sidebar');
+		if (settingsSidebar &&
+			(settingsSidebar.classList.contains('open') || settingsSidebar.classList.contains('mobile-open'))) {
+			setupSettingsPanel();
 		}
 	});
 }
