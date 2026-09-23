@@ -1,3 +1,7 @@
+# [修改] 上游仓库由 shuaiplus/NodeCrypt 改为作者自己的仓库 didingqd/nodecrypt。
+# 原配置每天会把别人仓库的 main 合并进本仓库 main，会让本项目自己的改动
+# （如「消息留存」）与上游反复合并、随时可能冲突，故改为只跟随自己的仓库。
+# 若上游仓库不是 didingqd/nodecrypt，只需改下面 git remote add 那一行的地址。
 name: Sync upstream
 
 on:
@@ -5,13 +9,20 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
+# [修改] 同步的最后一步要推送到本仓库，需要写权限。
+# 新仓库的 GITHUB_TOKEN 默认是只读，缺这一段时 `git push origin main` 会因权限不足失败。
+# 注意：还要求仓库 Settings → Actions → General → Workflow permissions 不是只读，
+# 否则这里的声明会被仓库设置覆盖。
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: |
-          git remote add upstream https://github.com/shuaiplus/NodeCrypt.git
+          git remote add upstream https://github.com/didingqd/nodecrypt.git
           git fetch upstream
           git checkout main
           git merge --ff-only upstream/main || git merge upstream/main --no-edit
