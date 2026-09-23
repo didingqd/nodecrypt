@@ -26,8 +26,7 @@ npm run build:docker        # Dockerfile 中前端构建阶段调用的别名
 npx vite                    # 仅调试前端时用：直接以 client/ 为根启动，带 HMR
 
 # 消息留存所需的 D1 / R2（详见下文「消息留存」一节，不用该功能可跳过）
-npx wrangler d1 create nodecrypt-history
-npx wrangler d1 migrations apply nodecrypt-history --remote
+# D1 库不需要 `wrangler d1 create`：由部署时的自动资源供给创建，见下文「部署前置」
 npx wrangler r2 bucket create nodecrypt-history-blobs
 ```
 
@@ -161,13 +160,14 @@ npx wrangler r2 bucket create nodecrypt-history-blobs
 
 ### 部署前置
 
-```bash
-npx wrangler d1 create nodecrypt-history    # database_id 需填回 wrangler.toml
-npx wrangler r2 bucket create nodecrypt-history-blobs
-npx wrangler d1 migrations apply nodecrypt-history --remote
-```
+**D1 库不需要手动创建。** `wrangler.toml` 里刻意不写 `database_id`，部署时由 wrangler 的「自动资源供给」(automatic resource provisioning) 自动建库并绑定（需 wrangler ≥ 4.45.0，`package.json` 已锁 `^4.136.3`；低于该版本会以 `code 10021 must have a valid database_id` 直接失败）。删掉 D1 / R2 绑定即可让功能自动降级为不存储。
 
-`wrangler.toml` 里 `database_id` 是占位符，未替换会导致 `wrangler deploy` 直接失败——部署前务必先建库。删掉 D1 / R2 绑定即可让功能自动降级为不存储。
+首次部署成功后还有两件事，各做一次：
+
+1. **建 R2 桶**：面板 → Storage & Databases → R2 → Create bucket，名字 `nodecrypt-history-blobs`。R2 **不会**被自动供给创建——配置里给了 `bucket_name`，wrangler 视作「资源已指定」，既不创建也不校验存在性，桶缺失只在运行时访问大记录时才报错。想让它也自动创建，就把 `bucket_name` 那行删掉（桶名会由 wrangler 生成）。
+2. **建表**：面板 → Storage & Databases → D1 → `nodecrypt-history` → Console，粘贴 `worker/migrations/0001_history.sql` 执行（语句均为 `IF NOT EXISTS`，可重复执行）。beta 阶段 wrangler 只把自动生成的库 ID 回写到 JSON 配置，`.toml` 的回写被静默忽略（workers-sdk#13632），因此 `wrangler d1 migrations apply` 在 CI 里用不了。
+
+若改为在面板手动建 D1 库，就把它的 UUID 填回 `wrangler.toml` 的 `database_id`，`wrangler d1 migrations apply <name> --remote` 随之恢复可用。
 
 ## 文件传输
 

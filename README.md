@@ -14,15 +14,14 @@
 
 #### 启用「消息留存」所需的存储资源（可选）
 
-不使用留存功能时可以跳过。若需要，部署前先创建资源并写入 `wrangler.toml`：
+不使用留存功能时可以跳过。`wrangler.toml` 中已内置 `DB`（D1）与 `HISTORY_BLOB`（R2）两个绑定和一个每分钟触发的定时清理任务，其中 **D1 库刻意不写 `database_id`**，部署时由 wrangler 的自动资源供给特性自动创建并绑定（要求 wrangler ≥ 4.45.0，本仓库已锁 `^4.136.3`），不需要在本地跑 `wrangler d1 create`。若删掉这两段绑定，客户端与 Worker 都会自动降级为「不存储」，实时聊天不受任何影响。
 
-```bash
-npx wrangler d1 create nodecrypt-history          # 把返回的 database_id 填入 wrangler.toml
-npx wrangler r2 bucket create nodecrypt-history-blobs
-npx wrangler d1 migrations apply nodecrypt-history --remote   # 建表
-```
+首次部署成功后，还需要各做一次：
 
-`wrangler.toml` 中已内置 `DB`（D1）与 `HISTORY_BLOB`（R2）两个绑定和一个每分钟触发的定时清理任务。若删掉这两段绑定，客户端与 Worker 都会自动降级为「不存储」，实时聊天不受任何影响。
+1. **建 R2 桶**：Cloudflare 面板 → Storage & Databases → R2 → Create bucket，名字填 `nodecrypt-history-blobs`。R2 不会被自动创建（配置里已给出桶名，wrangler 视作资源已指定），桶名不需要任何 id。
+2. **建表**：面板 → Storage & Databases → D1 → `nodecrypt-history` → Console，把 `worker/migrations/0001_history.sql` 的内容粘进去执行。beta 阶段 wrangler 不会把自动生成的库 ID 回写到 `.toml`，所以 `wrangler d1 migrations apply` 在 CI 里用不了，只能这样建表；文件里的语句均为 `IF NOT EXISTS`，重复执行无害。
+
+> 若你在面板上手动建了 D1 库，也可以把它的 UUID 填回 `wrangler.toml` 的 `database_id`，两种方式等效。
 
 
 ## 📝 项目简介
